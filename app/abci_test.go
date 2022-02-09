@@ -45,7 +45,7 @@ func TestPreprocessTxs(t *testing.T) {
 		t.Error(err)
 	}
 
-	testApp := setupApp(t, info.GetPubKey())
+	testApp := SetupApp(t, info.GetPubKey())
 
 	type test struct {
 		input            abci.RequestPreprocessTxs
@@ -95,7 +95,7 @@ func TestPreprocessTxs(t *testing.T) {
 	}
 }
 
-func setupApp(t *testing.T, pub cryptotypes.PubKey) *App {
+func SetupApp(t *testing.T, pub cryptotypes.PubKey) *App {
 	// var cache sdk.MultiStorePersistentCache
 	// EmptyAppOptions is a stub implementing AppOptions
 	emptyOpts := emptyAppOptions{}
