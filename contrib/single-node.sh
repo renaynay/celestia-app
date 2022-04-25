@@ -9,8 +9,10 @@ app="./celestia-appd"
 coins="1000000000000000uceles"
 $app init $CHAINID --chain-id $CHAINID 
 $app keys add validator --keyring-backend="test"
+$app keys add celes --keyring-backend="test"
 # this won't work because the some proto types are decalared twice and the logs output to stdout (dependency hell involving iavl)
 $app add-genesis-account $($app keys show validator -a --keyring-backend="test") $coins
+$app add-genesis-account $($app keys show celes -a --keyring-backend="test") $coins
 $app gentx validator 5000000000uceles --keyring-backend="test" --chain-id $CHAINID
 $app collect-gentxs
 
