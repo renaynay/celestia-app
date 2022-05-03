@@ -30,10 +30,9 @@ pre-build:
 
 build: mod
 	@go install github.com/gobuffalo/packr/v2/packr2@latest
-	@cd ./cmd/celestia-appd && packr2
+	@cd ./cmd/celestia-appd
 	@mkdir -p build/
 	@go build -o build/ ./cmd/celestia-appd
-	@packr2 clean
 	@go mod tidy
 
 install: go.sum

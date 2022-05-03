@@ -2,7 +2,7 @@
 
 set -o errexit -o nounset
 
-CHAINID="test"
+CHAINID="devnet-2"
 app="./celestia-appd"
 
 # Build genesis file incl account for passed address
