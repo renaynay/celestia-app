@@ -21,7 +21,7 @@ import (
 	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
 )
 
-var defaultSigner = testfactory.RandomAddress().String()
+var defaultSigner = testfactory.RandomAddress(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec).String()
 
 func RandMsgPayForBlobsWithSigner(singer string, size, blobCount int) (*blobtypes.MsgPayForBlobs, []*tmproto.Blob) {
 	blobs := make([]*tmproto.Blob, blobCount)

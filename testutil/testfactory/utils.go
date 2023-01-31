@@ -13,9 +13,6 @@ import (
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	rpctypes "github.com/tendermint/tendermint/rpc/core/types"
-
-	"github.com/celestiaorg/celestia-app/app"
-	"github.com/celestiaorg/celestia-app/app/encoding"
 )
 
 const (
@@ -57,9 +54,9 @@ func GenerateKeyring(cdc codec.Codec, accounts ...string) keyring.Keyring {
 	return kb
 }
 
-func RandomAddress() sdk.Address {
+func RandomAddress(cdc codec.Codec) sdk.Address {
 	name := tmrand.Str(6)
-	kr := GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, name)
+	kr := GenerateKeyring(cdc, name)
 	rec, err := kr.Key(name)
 	if err != nil {
 		panic(err)
