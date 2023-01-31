@@ -4,10 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/celestiaorg/celestia-app/testutil/namespace"
-	"github.com/celestiaorg/celestia-app/testutil/testfactory"
-	"github.com/celestiaorg/celestia-app/x/blob/types"
-	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/stretchr/testify/require"
@@ -16,6 +12,13 @@ import (
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	coretypes "github.com/tendermint/tendermint/types"
 	"google.golang.org/grpc"
+
+	"github.com/celestiaorg/celestia-app/app"
+	"github.com/celestiaorg/celestia-app/app/encoding"
+	"github.com/celestiaorg/celestia-app/testutil/namespace"
+	"github.com/celestiaorg/celestia-app/testutil/testfactory"
+	"github.com/celestiaorg/celestia-app/x/blob/types"
+	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
 )
 
 var defaultSigner = testfactory.RandomAddress().String()
@@ -84,7 +87,7 @@ func RandMsgPayForBlobs(size int) (*blobtypes.MsgPayForBlobs, *tmproto.Blob) {
 
 func RandBlobTxsRandomlySized(enc sdk.TxEncoder, count, maxSize, maxBlobs int) []coretypes.Tx {
 	const acc = "signer"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, acc)
 	signer := blobtypes.NewKeyringSigner(kr, acc, "chainid")
 	addr, err := signer.GetSignerInfo().GetAddress()
 	if err != nil {
@@ -213,7 +216,7 @@ func RandBlobTxsWithAccounts(
 
 func RandBlobTxs(enc sdk.TxEncoder, count, size int) []coretypes.Tx {
 	const acc = "signer"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, acc)
 	signer := blobtypes.NewKeyringSigner(kr, acc, "chainid")
 	addr, err := signer.GetSignerInfo().GetAddress()
 	if err != nil {
@@ -254,7 +257,7 @@ func RandBlobTxs(enc sdk.TxEncoder, count, size int) []coretypes.Tx {
 
 func RandBlobTxsWithNamespaces(enc sdk.TxEncoder, nIds [][]byte, sizes []int) []coretypes.Tx {
 	const acc = "signer"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, acc)
 	signer := blobtypes.NewKeyringSigner(kr, acc, "chainid")
 	return RandBlobTxsWithNamespacesAndSigner(enc, signer, nIds, sizes)
 }

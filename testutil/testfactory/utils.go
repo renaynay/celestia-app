@@ -39,8 +39,7 @@ func QueryWithoutProof(clientCtx client.Context, hashHexStr string) (*rpctypes.R
 	return node.Tx(context.Background(), hash, false)
 }
 
-func GenerateKeyring(accounts ...string) keyring.Keyring {
-	cdc := encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec
+func GenerateKeyring(cdc codec.Codec, accounts ...string) keyring.Keyring {
 	kb := keyring.NewInMemory(cdc)
 
 	for _, acc := range accounts {
@@ -60,7 +59,7 @@ func GenerateKeyring(accounts ...string) keyring.Keyring {
 
 func RandomAddress() sdk.Address {
 	name := tmrand.Str(6)
-	kr := GenerateKeyring(name)
+	kr := GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, name)
 	rec, err := kr.Key(name)
 	if err != nil {
 		panic(err)
@@ -73,7 +72,7 @@ func RandomAddress() sdk.Address {
 }
 
 func FundKeyringAccounts(cdc codec.Codec, accounts ...string) (keyring.Keyring, []banktypes.Balance, []authtypes.GenesisAccount) {
-	kr := GenerateKeyring(accounts...)
+	kr := GenerateKeyring(cdc, accounts...)
 	genAccounts := make([]authtypes.GenesisAccount, len(accounts))
 	genBalances := make([]banktypes.Balance, len(accounts))
 

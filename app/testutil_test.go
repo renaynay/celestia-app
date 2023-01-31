@@ -3,9 +3,10 @@ package app
 import (
 	"testing"
 
-	"github.com/celestiaorg/celestia-app/app/encoding"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	coretypes "github.com/tendermint/tendermint/types"
+
+	"github.com/celestiaorg/celestia-app/app/encoding"
 
 	"github.com/celestiaorg/celestia-app/testutil/blobfactory"
 	"github.com/celestiaorg/celestia-app/testutil/testfactory"
@@ -28,7 +29,7 @@ func generateMixedTxs(normalTxCount, pfbCount, pfbSize int) ([][]byte, []tmproto
 func generateBlobTxsWithNIDs(t *testing.T, nids [][]byte, blobSizes [][]int) []tmproto.BlobTx {
 	encCfg := encoding.MakeConfig(ModuleEncodingRegisters...)
 	const acc = "signer"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(encCfg.Codec, acc)
 	txs := blobfactory.ManyMultiBlobTx(
 		t,
 		encCfg.TxConfig.TxEncoder(),

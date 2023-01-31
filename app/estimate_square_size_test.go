@@ -3,6 +3,10 @@ package app
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	coretypes "github.com/tendermint/tendermint/types"
+
 	"github.com/celestiaorg/celestia-app/app/encoding"
 	"github.com/celestiaorg/celestia-app/pkg/appconsts"
 	"github.com/celestiaorg/celestia-app/pkg/shares"
@@ -10,9 +14,6 @@ import (
 	"github.com/celestiaorg/celestia-app/testutil/namespace"
 	"github.com/celestiaorg/celestia-app/testutil/testfactory"
 	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	coretypes "github.com/tendermint/tendermint/types"
 )
 
 func Test_estimateSquareSize(t *testing.T) {
@@ -48,7 +49,7 @@ func Test_estimateSquareSize(t *testing.T) {
 func Test_estimateSquareSize_MultiBlob(t *testing.T) {
 	enc := encoding.MakeConfig(ModuleEncodingRegisters...)
 	acc := "account"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(enc.Codec, acc)
 	signer := blobtypes.NewKeyringSigner(kr, acc, "chainid")
 	type test struct {
 		name                       string

@@ -1,12 +1,15 @@
 package blobfactory
 
 import (
-	"github.com/celestiaorg/celestia-app/testutil/testfactory"
-	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
 	"github.com/cosmos/cosmos-sdk/client"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	coretypes "github.com/tendermint/tendermint/types"
+
+	"github.com/celestiaorg/celestia-app/app"
+	"github.com/celestiaorg/celestia-app/app/encoding"
+	"github.com/celestiaorg/celestia-app/testutil/testfactory"
+	blobtypes "github.com/celestiaorg/celestia-app/x/blob/types"
 )
 
 const (
@@ -17,7 +20,7 @@ const (
 
 func GenerateManyRawSendTxs(txConfig client.TxConfig, count int) []coretypes.Tx {
 	const acc = "signer"
-	kr := testfactory.GenerateKeyring(acc)
+	kr := testfactory.GenerateKeyring(encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec, acc)
 	signer := blobtypes.NewKeyringSigner(kr, acc, "chainid")
 	txs := make([]coretypes.Tx, count)
 	for i := 0; i < count; i++ {
