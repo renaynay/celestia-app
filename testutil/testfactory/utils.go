@@ -8,12 +8,14 @@ import (
 	"github.com/cosmos/cosmos-sdk/codec"
 	"github.com/cosmos/cosmos-sdk/crypto/hd"
 	"github.com/cosmos/cosmos-sdk/crypto/keyring"
-	"github.com/cosmos/cosmos-sdk/simapp"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	rpctypes "github.com/tendermint/tendermint/rpc/core/types"
+
+	"github.com/celestiaorg/celestia-app/app"
+	"github.com/celestiaorg/celestia-app/app/encoding"
 )
 
 const (
@@ -38,7 +40,7 @@ func QueryWithoutProof(clientCtx client.Context, hashHexStr string) (*rpctypes.R
 }
 
 func GenerateKeyring(accounts ...string) keyring.Keyring {
-	cdc := simapp.MakeTestEncodingConfig().Codec
+	cdc := encoding.MakeConfig(app.ModuleEncodingRegisters...).Codec
 	kb := keyring.NewInMemory(cdc)
 
 	for _, acc := range accounts {
