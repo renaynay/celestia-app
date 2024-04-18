@@ -7,12 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/celestiaorg/celestia-app/app"
-	"github.com/celestiaorg/celestia-app/app/encoding"
-	"github.com/celestiaorg/celestia-app/pkg/appconsts"
-	"github.com/celestiaorg/celestia-app/pkg/user"
-	"github.com/celestiaorg/celestia-app/test/util/blobfactory"
-	"github.com/celestiaorg/celestia-app/x/blob/types"
 	"github.com/celestiaorg/go-square/blob"
 	appns "github.com/celestiaorg/go-square/namespace"
 	"github.com/celestiaorg/go-square/shares"
@@ -25,6 +19,13 @@ import (
 	tmconfig "github.com/tendermint/tendermint/config"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	rpctypes "github.com/tendermint/tendermint/rpc/core/types"
+
+	"github.com/celestiaorg/celestia-app/app"
+	"github.com/celestiaorg/celestia-app/app/encoding"
+	"github.com/celestiaorg/celestia-app/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/pkg/user"
+	"github.com/celestiaorg/celestia-app/test/util/blobfactory"
+	"github.com/celestiaorg/celestia-app/x/blob/types"
 )
 
 const (
@@ -32,9 +33,11 @@ const (
 )
 
 type Context struct {
-	rootCtx context.Context
 	client.Context
+
+	rootCtx    context.Context
 	apiAddress string
+	fillBlobNS appns.Namespace
 }
 
 func NewContext(goCtx context.Context, kr keyring.Keyring, tmCfg *tmconfig.Config, chainID, apiAddress string) Context {
@@ -49,11 +52,17 @@ func NewContext(goCtx context.Context, kr keyring.Keyring, tmCfg *tmconfig.Confi
 		WithTxConfig(ecfg.TxConfig).
 		WithAccountRetriever(authtypes.AccountRetriever{})
 
-	return Context{rootCtx: goCtx, Context: cctx, apiAddress: apiAddress}
+	return Context{rootCtx: goCtx, Context: cctx, apiAddress: apiAddress, fillBlobNS: appns.RandomNamespace()}
 }
 
 func (c *Context) GoContext() context.Context {
 	return c.rootCtx
+}
+
+// TestNamespace returns the random namespace used to submit
+// blobs when filling blocks.
+func (c *Context) TestNamespace() appns.Namespace {
+	return c.fillBlobNS
 }
 
 // GenesisTime returns the genesis block time.
@@ -298,7 +307,8 @@ func (c *Context) FillBlock(squareSize int, account string, broadcastMode string
 
 	// we use a formula to guarantee that the tx is the exact size needed to force a specific square size.
 	blobSize := shares.AvailableBytesFromSparseShares(shareCount)
-	return c.PostData(account, broadcastMode, appns.RandomBlobNamespace(), tmrand.Bytes(blobSize))
+
+	return c.PostData(account, broadcastMode, c.TestNamespace(), tmrand.Bytes(blobSize))
 }
 
 // HeightForTimestamp returns the block height for the first block after a
