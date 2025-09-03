@@ -1,6 +1,7 @@
 package testnode
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path"
@@ -31,6 +32,7 @@ var noOpCleanup = func() error { return nil }
 // the internal context.Context in the returned Context.
 func StartNode(cometNode *node.Node, cctx Context) (Context, func() error, error) {
 	if err := cometNode.Start(); err != nil {
+		fmt.Println("ERRORING HERE 35:  ", err)
 		return cctx, noOpCleanup, err
 	}
 	client := local.New(cometNode)

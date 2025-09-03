@@ -6,9 +6,6 @@ import (
 	"time"
 
 	"cosmossdk.io/log"
-	"github.com/celestiaorg/celestia-app/v6/app"
-	"github.com/celestiaorg/celestia-app/v6/pkg/appconsts"
-	"github.com/celestiaorg/celestia-app/v6/test/util/genesis"
 	tmconfig "github.com/cometbft/cometbft/config"
 	tmproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	dbm "github.com/cosmos/cosmos-db"
@@ -17,6 +14,10 @@ import (
 	srvconfig "github.com/cosmos/cosmos-sdk/server/config"
 	srvtypes "github.com/cosmos/cosmos-sdk/server/types"
 	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
+
+	"github.com/celestiaorg/celestia-app/v6/app"
+	"github.com/celestiaorg/celestia-app/v6/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/v6/test/util/genesis"
 )
 
 const (
@@ -148,10 +149,26 @@ func DefaultConsensusParams() *tmproto.ConsensusParams {
 func DefaultTendermintConfig() *tmconfig.Config {
 	tmCfg := app.DefaultConsensusConfig()
 
-	// Set all the ports to random open ones.
-	tmCfg.RPC.ListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", GetDeterministicPort())
-	tmCfg.P2P.ListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", GetDeterministicPort())
-	tmCfg.RPC.GRPCListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", GetDeterministicPort())
+	port, err := GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("PORT FOR RPC LISTEN ADDR:  ", port)
+	tmCfg.RPC.ListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", port)
+
+	port, err = GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("PORT FOR P2P LISTEN ADDR:  ", port)
+	tmCfg.P2P.ListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", port)
+
+	port, err = GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("PORT FOR GRPC LISTEN:  ", port)
+	tmCfg.RPC.GRPCListenAddress = fmt.Sprintf("tcp://127.0.0.1:%d", port)
 
 	tmCfg.TxIndex.Indexer = "kv"
 
@@ -201,8 +218,17 @@ func CustomAppCreator(appOptions ...func(*baseapp.BaseApp)) srvtypes.AppCreator 
 func DefaultAppConfig() *srvconfig.Config {
 	appCfg := app.DefaultAppConfig()
 	appCfg.GRPC.Enable = true
-	appCfg.GRPC.Address = fmt.Sprintf("127.0.0.1:%d", GetDeterministicPort())
+	port, err := GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	appCfg.GRPC.Address = fmt.Sprintf("127.0.0.1:%d", port)
+
 	appCfg.API.Enable = true
-	appCfg.API.Address = fmt.Sprintf("tcp://127.0.0.1:%d", GetDeterministicPort())
+	port, err = GetFreePort()
+	if err != nil {
+		panic(err)
+	}
+	appCfg.API.Address = fmt.Sprintf("tcp://127.0.0.1:%d", port)
 	return appCfg
 }
