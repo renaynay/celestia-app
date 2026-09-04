@@ -60,10 +60,12 @@ func (cfg *StoreConfig) Validate() error {
 // Store manages persistent storage of [PaymentPromise] and row data.
 // It provides indexed access by [Commitment], promise hash, and timestamp.
 type Store struct {
-	db     *pebbledb.DB
-	log    *slog.Logger
-	shards shardStorage
-	local  *localBackend
+	db            *pebbledb.DB
+	log           *slog.Logger
+	shards        shardStorage
+	shardsBackend byte
+	local         *localBackend
+	object        shardStorage
 }
 
 // memStorePath is an arbitrary location inside the in-memory FS used by
@@ -112,7 +114,7 @@ func openStore(cfg StoreConfig, filesystem vfs.FS) (*Store, error) {
 		return nil, fmt.Errorf("opening pebble database: %w", err)
 	}
 
-	s := &Store{db: db, log: cfg.Log, shards: local, local: local}
+	s := &Store{db: db, log: cfg.Log, shards: local, shardsBackend: localBackendTag, local: local}
 	if err := s.reconcile(); err != nil {
 		_ = s.db.Close()
 		return nil, fmt.Errorf("reconciling store: %w", err)
@@ -120,12 +122,9 @@ func openStore(cfg StoreConfig, filesystem vfs.FS) (*Store, error) {
 	return s, nil
 }
 
-// Put stores a [PaymentPromise] and [types.BlobShard] using a stage → publish
-// → commit pattern: write tmp under staging/, rename into shards/<commit>-<hash>,
-// then commit pebble metadata. A crash between rename and commit can leave an
-// orphan file that [Store.reconcile] removes on the next open.
-// Puts for the same commitment but different promises are stored independently
-// without deduplication.
+// Put stores a [PaymentPromise] and [types.BlobShard] in the write backend,
+// then commits Pebble metadata. Puts for the same commitment but different
+// promises are stored independently without deduplication.
 func (s *Store) Put(ctx context.Context, promise *PaymentPromise, shard *types.BlobShard, pruneAt time.Time) error {
 	// Respect a client that has already gone away: skip the staging write
 	// entirely rather than doing work whose result nobody is waiting for.
@@ -138,7 +137,7 @@ func (s *Store) Put(ctx context.Context, promise *PaymentPromise, shard *types.B
 		return fmt.Errorf("getting promise hash: %w", err)
 	}
 
-	marker := encodeShardMarker(shardBinarySize(shard))
+	marker := encodeShardMarkerForBackend(s.shardsBackend, shardBinarySize(shard))
 	return s.commitAndStore(ctx, promise, promiseHash, shard, marker, pruneAt)
 }
 
@@ -192,9 +191,8 @@ func (s *Store) commitAndStore(ctx context.Context, promise *PaymentPromise, pro
 // first prevents unbounded message sizes; pebble's deterministic key order
 // makes the choice consistent across validators.
 //
-// Get may write to pebble: if a /shard/ marker is found but the backing file
-// is missing (crash leftover or pebble.NoSync power loss), the marker is
-// deleted inline so future Gets stop paying the missed lookup.
+// Get removes a local marker when its payload is missing. It preserves a
+// missing object marker and reports an integrity error.
 func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShard, error) {
 	prefix := fmt.Appendf(nil, "/shard/%s/", commitment.String())
 	iter, err := s.db.NewIter(&pebbledb.IterOptions{
@@ -208,7 +206,13 @@ func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShar
 
 	var rerr error
 	for valid := iter.First(); valid; valid = iter.Next() {
-		if _, err := decodeShardMarker(iter.Value()); err != nil {
+		backendTag, _, err := decodeShardMarkerBackend(iter.Value())
+		if err != nil {
+			rerr = errors.Join(rerr, err)
+			continue
+		}
+		backend, err := s.shardBackend(backendTag)
+		if err != nil {
 			rerr = errors.Join(rerr, err)
 			continue
 		}
@@ -219,11 +223,15 @@ func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShar
 			continue
 		}
 
-		shard, err := s.shards.Get(ctx, commitment, promiseHash)
+		shard, err := backend.Get(ctx, commitment, promiseHash)
 		if err == nil {
 			return shard, nil
 		}
 		if errors.Is(err, ErrStoreNotFound) {
+			if backendTag == objectBackendTag {
+				rerr = errors.Join(rerr, fmt.Errorf("%w: object shard payload is missing", ErrStoreIntegrity))
+				continue
+			}
 			// Orphan marker — drop it. The /prune/ entry self-cleans at TTL.
 			if delErr := s.db.Delete(shardKey(commitment, promiseHash), pebbledb.NoSync); delErr != nil {
 				s.log.Warn("failed to clean orphan shard marker",
@@ -233,7 +241,7 @@ func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShar
 			}
 			continue
 		}
-		rerr = errors.Join(rerr, fmt.Errorf("reading shard file: %w", err))
+		rerr = errors.Join(rerr, fmt.Errorf("reading shard payload: %w", err))
 	}
 
 	if err := iter.Error(); err != nil {
@@ -247,21 +255,49 @@ func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShar
 
 // Has verifies that shard exists without reading the whole file
 func (s *Store) Has(ctx context.Context, commitment Commitment, promiseHash []byte) (bool, error) {
-	markerData, closer, err := s.db.Get(shardKey(commitment, promiseHash))
+	var (
+		backendTag              byte
+		markerData, closer, err = s.db.Get(shardKey(commitment, promiseHash))
+	)
 	switch {
 	case errors.Is(err, pebbledb.ErrNotFound):
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("checking if shard exists failed: %w", err)
 	default:
-		_, err = decodeShardMarker(markerData)
+		backendTag, _, err = decodeShardMarkerBackend(markerData)
 		_ = closer.Close()
 		if err != nil {
 			return false, err
 		}
 	}
 
-	return s.shards.Has(ctx, commitment, promiseHash)
+	backend, err := s.shardBackend(backendTag)
+	if err != nil {
+		return false, err
+	}
+	has, err := backend.Has(ctx, commitment, promiseHash)
+	if err != nil {
+		return false, err
+	}
+	if !has && backendTag == objectBackendTag {
+		return false, fmt.Errorf("%w: object shard payload is missing", ErrStoreIntegrity)
+	}
+	return has, nil
+}
+
+func (s *Store) shardBackend(tag byte) (shardStorage, error) {
+	switch tag {
+	case localBackendTag:
+		return s.local, nil
+	case objectBackendTag:
+		if s.object == nil {
+			return nil, fmt.Errorf("%w: object shard backend is unavailable", ErrStoreIntegrity)
+		}
+		return s.object, nil
+	default:
+		return nil, fmt.Errorf("%w: unsupported shard backend tag 0x%02x", ErrStoreIntegrity, tag)
+	}
 }
 
 // hasAccountedShardMarker reports whether a marker validated by [Store.Has]
