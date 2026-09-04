@@ -445,13 +445,28 @@ func (s *Store) PruneBefore(ctx context.Context, before time.Time) (int, int64, 
 	batch := s.db.NewBatch()
 	defer batch.Close()
 	var (
-		pruned         int
-		prunedBytes    int64
-		integrityErr   error
-		corruptMarkers int
+		selected         int
+		selectedBytes    int64
+		pruned           int
+		prunedBytes      int64
+		firstErr         error
+		errorCount       int
+		localCandidates  []pruneCandidate
+		objectCandidates []pruneCandidate
+		successful       []pruneCandidate
 	)
+	recordError := func(err error) {
+		errorCount++
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 	beforeStr := formatTimestamp(before.UTC())
-	for valid := iter.First(); valid && pruned < maxPruneBatchSize; valid = iter.Next() {
+	for valid := iter.First(); valid && selected < maxPruneBatchSize; valid = iter.Next() {
+		if err := ctx.Err(); err != nil {
+			recordError(err)
+			break
+		}
 		key := iter.Key()
 
 		// Keys are sorted; once the timestamp reaches the cutoff we're done.
@@ -465,62 +480,122 @@ func (s *Store) PruneBefore(ctx context.Context, before time.Time) (int, int64, 
 			continue
 		}
 
-		markerData, closer, err := s.db.Get(shardKey(commitment, promiseHash))
-		var size int64
+		var (
+			backendTag              = localBackendTag
+			size                    int64
+			markerData, closer, err = s.db.Get(shardKey(commitment, promiseHash))
+		)
 		switch {
 		case errors.Is(err, pebbledb.ErrNotFound):
 		case err != nil:
-			return pruned, prunedBytes, fmt.Errorf("getting shard marker: %w", err)
+			recordError(fmt.Errorf("getting shard marker: %w", err))
+			continue
 		default:
-			size, err = decodeShardMarker(markerData)
+			backendTag, size, err = decodeShardMarkerBackend(markerData)
 			_ = closer.Close()
 			if err != nil {
-				corruptMarkers++
-				if integrityErr == nil {
-					integrityErr = fmt.Errorf("decoding shard marker %q: %w", key, err)
-				}
+				recordError(fmt.Errorf("decoding shard marker %q: %w", key, err))
 				continue
 			}
 		}
 
+		selected++
 		if size == 0 {
 			size, err = s.local.size(commitment, promiseHash)
 			if err != nil {
-				return pruned, prunedBytes, fmt.Errorf("getting shard file stats: %w", err)
+				recordError(fmt.Errorf("getting shard file stats: %w", err))
+				continue
 			}
 		}
-		if size > math.MaxInt64-prunedBytes {
-			return pruned, prunedBytes, fmt.Errorf("%w: pruned shard size overflows int64", ErrStoreIntegrity)
+		if size > math.MaxInt64-selectedBytes {
+			recordError(fmt.Errorf("%w: pruned shard size overflows int64", ErrStoreIntegrity))
+			continue
 		}
+		selectedBytes += size
 
-		// Missing file is fine (orphan marker from a crashed Put).
-		if err := s.shards.Delete(ctx, commitment, promiseHash); err != nil {
-			return pruned, prunedBytes, err
+		candidate := pruneCandidate{
+			pruneKey:    slices.Clone(key),
+			commitment:  commitment,
+			promiseHash: promiseHash,
+			size:        size,
 		}
-		if err := batch.Delete(key, pebbledb.NoSync); err != nil {
-			return pruned, prunedBytes, fmt.Errorf("deleting prune index: %w", err)
+		switch backendTag {
+		case localBackendTag:
+			localCandidates = append(localCandidates, candidate)
+		case objectBackendTag:
+			objectCandidates = append(objectCandidates, candidate)
 		}
-		if err := batch.Delete(shardKey(commitment, promiseHash), pebbledb.NoSync); err != nil {
-			return pruned, prunedBytes, fmt.Errorf("deleting shard marker: %w", err)
-		}
-		if err := batch.Delete(promiseKey(promiseHash), pebbledb.NoSync); err != nil {
-			return pruned, prunedBytes, fmt.Errorf("deleting payment promise: %w", err)
-		}
-		pruned++
-		prunedBytes += size
 	}
 
 	if err := iter.Error(); err != nil {
-		return pruned, prunedBytes, fmt.Errorf("iterating prune index: %w", err)
+		return 0, 0, fmt.Errorf("iterating prune index: %w", err)
+	}
+
+	for _, candidate := range localCandidates {
+		if err := s.local.Delete(ctx, candidate.commitment, candidate.promiseHash); err != nil {
+			recordError(err)
+			continue
+		}
+		successful = append(successful, candidate)
+	}
+
+	if len(objectCandidates) > 0 {
+		object, ok := s.object.(interface {
+			DeleteObjects(context.Context, []shardID) ([]error, error)
+		})
+		if !ok {
+			recordError(fmt.Errorf("%w: object shard backend does not support batch deletion", ErrStoreIntegrity))
+		} else {
+			ids := make([]shardID, len(objectCandidates))
+			for i, candidate := range objectCandidates {
+				ids[i] = shardID{commitment: candidate.commitment, promiseHash: candidate.promiseHash}
+			}
+			deleteErrors, err := object.DeleteObjects(ctx, ids)
+			switch {
+			case err != nil:
+				recordError(err)
+			case len(deleteErrors) != len(objectCandidates):
+				recordError(fmt.Errorf("object delete response has %d results, want %d", len(deleteErrors), len(objectCandidates)))
+			default:
+				for i, deleteErr := range deleteErrors {
+					if deleteErr != nil {
+						recordError(deleteErr)
+						continue
+					}
+					successful = append(successful, objectCandidates[i])
+				}
+			}
+		}
+	}
+
+	for _, candidate := range successful {
+		if err := batch.Delete(candidate.pruneKey, pebbledb.NoSync); err != nil {
+			return 0, 0, fmt.Errorf("deleting prune index: %w", err)
+		}
+		if err := batch.Delete(shardKey(candidate.commitment, candidate.promiseHash), pebbledb.NoSync); err != nil {
+			return 0, 0, fmt.Errorf("deleting shard marker: %w", err)
+		}
+		if err := batch.Delete(promiseKey(candidate.promiseHash), pebbledb.NoSync); err != nil {
+			return 0, 0, fmt.Errorf("deleting payment promise: %w", err)
+		}
+		pruned++
+		prunedBytes += candidate.size
 	}
 
 	if err := batch.Commit(pebbledb.NoSync); err != nil {
-		return pruned, prunedBytes, fmt.Errorf("committing batch: %w", err)
+		return 0, 0, fmt.Errorf("committing batch: %w", err)
 	}
-	if corruptMarkers > 1 {
-		integrityErr = fmt.Errorf("%w (%d corrupt shard markers)", integrityErr, corruptMarkers)
+	if errorCount > 1 {
+		firstErr = fmt.Errorf("%w (%d prune errors)", firstErr, errorCount)
 	}
-	return pruned, prunedBytes, integrityErr
+	return pruned, prunedBytes, firstErr
+}
+
+type pruneCandidate struct {
+	pruneKey    []byte
+	commitment  Commitment
+	promiseHash []byte
+	size        int64
 }
 
 // reconcile drops incomplete staging files and canonical shard files without
