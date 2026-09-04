@@ -12,6 +12,7 @@ import (
 
 	"github.com/celestiaorg/celestia-app/v10/x/fibre/types"
 	pebbledb "github.com/cockroachdb/pebble/v2"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -28,6 +29,97 @@ func TestShardMarkerCodec(t *testing.T) {
 	size, err = decodeShardMarker(nil)
 	require.NoError(t, err)
 	require.Zero(t, size)
+
+	backend, size, err := decodeShardMarkerBackend(encodeShardMarkerForBackend(objectBackendTag, 42))
+	require.NoError(t, err)
+	require.Equal(t, objectBackendTag, backend)
+	require.Equal(t, int64(42), size)
+}
+
+func TestStoreRoutesObjectShard(t *testing.T) {
+	store := newMarkerTestStore(t)
+	object := &shardStorageStub{}
+	store.shards = object
+	store.shardsBackend = objectBackendTag
+	store.object = object
+
+	commitment := generateCommitment()
+	shard := &types.BlobShard{Rows: []*types.BlobRow{{Index: 1, Data: []byte("data")}}}
+	promise := &PaymentPromise{
+		ChainID:           "test-chain",
+		SignerKey:         secp256k1.GenPrivKey().PubKey().(*secp256k1.PubKey),
+		Commitment:        commitment,
+		CreationTimestamp: time.Unix(1, 0),
+		Signature:         []byte{1},
+	}
+	require.NoError(t, store.Put(t.Context(), promise, shard, promise.CreationTimestamp))
+
+	promiseHash, err := promise.Hash()
+	require.NoError(t, err)
+	markerData, closer, err := store.db.Get(shardKey(promise.Commitment, promiseHash))
+	require.NoError(t, err)
+	require.NoError(t, closer.Close())
+	require.Equal(t, objectBackendTag, markerData[1])
+	require.Equal(t, 1, object.puts)
+
+	got, err := store.Get(t.Context(), commitment)
+	require.NoError(t, err)
+	require.Equal(t, shard, got)
+	has, err := store.Has(t.Context(), commitment, promiseHash)
+	require.NoError(t, err)
+	require.True(t, has)
+	require.Equal(t, 1, object.gets)
+	require.Equal(t, 1, object.heads)
+
+	size, err := store.Size(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, shardBinarySize(shard), size)
+}
+
+func TestStoreMissingObjectPreservesMetadata(t *testing.T) {
+	store := newMarkerTestStore(t)
+	commitment := generateCommitment()
+	promiseHash := []byte{1}
+	marker := []byte{1, objectBackendTag, 0, 0, 0, 0, 0, 0, 0, 1}
+	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), marker, pebbledb.NoSync))
+
+	_, err := store.Get(t.Context(), commitment)
+	require.ErrorIs(t, err, ErrStoreIntegrity)
+
+	store.object = &shardStorageStub{missing: true}
+	_, err = store.Get(t.Context(), commitment)
+	require.ErrorIs(t, err, ErrStoreIntegrity)
+	has, err := store.Has(t.Context(), commitment, promiseHash)
+	require.ErrorIs(t, err, ErrStoreIntegrity)
+	require.False(t, has)
+
+	data, closer, err := store.db.Get(shardKey(commitment, promiseHash))
+	require.NoError(t, err)
+	require.Equal(t, marker, data)
+	require.NoError(t, closer.Close())
+}
+
+func TestStoreGetSkipsMissingObjectToLocalSibling(t *testing.T) {
+	store := newMarkerTestStore(t)
+	object := &shardStorageStub{missing: true}
+	store.object = object
+	commitment := generateCommitment()
+	objectHash := []byte{1}
+	localHash := []byte{2}
+	wantSize := writeMarkerTestShard(t, store, commitment, localHash)
+	objectMarker := encodeShardMarkerForBackend(objectBackendTag, 1)
+	require.NoError(t, store.db.Set(shardKey(commitment, objectHash), objectMarker, pebbledb.NoSync))
+	require.NoError(t, store.db.Set(shardKey(commitment, localHash), encodeShardMarker(wantSize), pebbledb.NoSync))
+
+	shard, err := store.Get(t.Context(), commitment)
+	require.NoError(t, err)
+	require.Equal(t, []byte("data"), shard.Rows[0].Data)
+	require.Equal(t, 1, object.gets)
+
+	data, closer, err := store.db.Get(shardKey(commitment, objectHash))
+	require.NoError(t, err)
+	require.Equal(t, objectMarker, data)
+	require.NoError(t, closer.Close())
 }
 
 func TestShardMarkerRejectsInvalidData(t *testing.T) {
@@ -37,8 +129,8 @@ func TestShardMarkerRejectsInvalidData(t *testing.T) {
 	binary.BigEndian.PutUint64(overflow[2:], uint64(math.MaxInt64)+1)
 	zeroBackend := append([]byte(nil), valid...)
 	zeroBackend[1] = 0
-	objectBackend := append([]byte(nil), valid...)
-	objectBackend[1] = 2
+	unknownBackend := append([]byte(nil), valid...)
+	unknownBackend[1] = 3
 	tests := []struct {
 		name string
 		data []byte
@@ -48,7 +140,7 @@ func TestShardMarkerRejectsInvalidData(t *testing.T) {
 		{"zero version", append([]byte{0}, valid[1:]...)},
 		{"unsupported version", append([]byte{2}, valid[1:]...)},
 		{"zero backend", zeroBackend},
-		{"object backend", objectBackend},
+		{"unknown backend", unknownBackend},
 		{"zero size", []byte{1, 1, 0, 0, 0, 0, 0, 0, 0, 0}},
 		{"size overflow", overflow},
 	}
@@ -116,7 +208,7 @@ func TestStoreRejectsInvalidShardMarkerWithoutDeletingItsData(t *testing.T) {
 			promiseHash := []byte{1, 2, 3}
 			pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
 			writeMarkerTestShard(t, store, commitment, promiseHash)
-			invalidMarker := []byte{1, 2, 0, 0, 0, 0, 0, 0, 0, 1}
+			invalidMarker := []byte{1, 3, 0, 0, 0, 0, 0, 0, 0, 1}
 			require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), invalidMarker, pebbledb.NoSync))
 			require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, promiseHash), nil, pebbledb.NoSync))
 
@@ -136,7 +228,7 @@ func TestGetSkipsInvalidMarkerAndReturnsValidShard(t *testing.T) {
 	commitment := generateCommitment()
 	invalidHash := []byte{1}
 	validHash := []byte{2}
-	invalidMarker := []byte{1, 2, 0, 0, 0, 0, 0, 0, 0, 1}
+	invalidMarker := []byte{1, 3, 0, 0, 0, 0, 0, 0, 0, 1}
 	writeMarkerTestShard(t, store, commitment, invalidHash)
 	validSize := writeMarkerTestShard(t, store, commitment, validHash)
 	validMarker := encodeShardMarker(validSize)
@@ -230,7 +322,7 @@ func TestPruneBeforeSkipsInvalidMarkerAndPrunesValidEntry(t *testing.T) {
 	writeMarkerTestShard(t, store, commitment, invalidHash)
 	validMarker := encodeShardMarker(validSize)
 	require.NoError(t, store.db.Set(shardKey(commitment, validHash), validMarker, pebbledb.NoSync))
-	require.NoError(t, store.db.Set(shardKey(commitment, invalidHash), []byte{1, 2, 0, 0, 0, 0, 0, 0, 0, 1}, pebbledb.NoSync))
+	require.NoError(t, store.db.Set(shardKey(commitment, invalidHash), []byte{1, 3, 0, 0, 0, 0, 0, 0, 0, 1}, pebbledb.NoSync))
 	require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, validHash), nil, pebbledb.NoSync))
 	require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, invalidHash), nil, pebbledb.NoSync))
 
@@ -356,4 +448,35 @@ func writeMarkerTestShard(t *testing.T, store *Store, commitment Commitment, pro
 	info, err := store.local.fs.Stat(path)
 	require.NoError(t, err)
 	return info.Size()
+}
+
+type shardStorageStub struct {
+	shard   *types.BlobShard
+	missing bool
+	puts    int
+	gets    int
+	heads   int
+}
+
+func (s *shardStorageStub) Put(_ context.Context, _ Commitment, _ []byte, shard *types.BlobShard) (bool, error) {
+	s.puts++
+	s.shard = shard
+	return true, nil
+}
+
+func (s *shardStorageStub) Get(context.Context, Commitment, []byte) (*types.BlobShard, error) {
+	s.gets++
+	if s.missing {
+		return nil, ErrStoreNotFound
+	}
+	return s.shard, nil
+}
+
+func (s *shardStorageStub) Has(context.Context, Commitment, []byte) (bool, error) {
+	s.heads++
+	return !s.missing, nil
+}
+
+func (*shardStorageStub) Delete(context.Context, Commitment, []byte) error {
+	return nil
 }
