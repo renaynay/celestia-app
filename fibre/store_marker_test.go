@@ -1,6 +1,7 @@
 package fibre
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"math"
@@ -120,7 +121,7 @@ func TestStoreRejectsInvalidShardMarkerWithoutDeletingItsData(t *testing.T) {
 			require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, promiseHash), nil, pebbledb.NoSync))
 
 			require.ErrorIs(t, tt.call(store, commitment, promiseHash, pruneAt), ErrStoreIntegrity)
-			_, err := store.fs.Stat(store.shardFilePath(commitment, promiseHash))
+			_, err := store.local.fs.Stat(store.local.shardPath(commitment, promiseHash))
 			require.NoError(t, err)
 			data, closer, err := store.db.Get(shardKey(commitment, promiseHash))
 			require.NoError(t, err)
@@ -161,7 +162,7 @@ func TestRemoveOrphanShardsPreservesInvalidMarker(t *testing.T) {
 	removed, err := store.removeOrphanShards()
 	require.NoError(t, err)
 	require.Zero(t, removed)
-	_, err = store.fs.Stat(store.shardFilePath(commitment, promiseHash))
+	_, err = store.local.fs.Stat(store.local.shardPath(commitment, promiseHash))
 	require.NoError(t, err)
 }
 
@@ -240,12 +241,31 @@ func TestPruneBeforeSkipsInvalidMarkerAndPrunesValidEntry(t *testing.T) {
 	_, closer, err := store.db.Get(shardKey(commitment, validHash))
 	require.ErrorIs(t, err, pebbledb.ErrNotFound)
 	require.Nil(t, closer)
-	_, err = store.fs.Stat(store.shardFilePath(commitment, validHash))
+	_, err = store.local.fs.Stat(store.local.shardPath(commitment, validHash))
 	require.ErrorIs(t, err, os.ErrNotExist)
 	_, closer, err = store.db.Get(shardKey(commitment, invalidHash))
 	require.NoError(t, err)
 	require.NoError(t, closer.Close())
-	_, err = store.fs.Stat(store.shardFilePath(commitment, invalidHash))
+	_, err = store.local.fs.Stat(store.local.shardPath(commitment, invalidHash))
+	require.NoError(t, err)
+}
+
+func TestPruneBeforeHonoursCancellation(t *testing.T) {
+	store := newMarkerTestStore(t)
+	commitment := generateCommitment()
+	promiseHash := []byte{1}
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	size := writeMarkerTestShard(t, store, commitment, promiseHash)
+	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), encodeShardMarker(size), pebbledb.NoSync))
+	require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, promiseHash), nil, pebbledb.NoSync))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	pruned, freed, err := store.PruneBefore(ctx, pruneAt.Add(time.Hour))
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, pruned)
+	require.Zero(t, freed)
+	_, err = store.local.fs.Stat(store.local.shardPath(commitment, promiseHash))
 	require.NoError(t, err)
 }
 
@@ -326,14 +346,14 @@ func newMarkerTestStore(t *testing.T) *Store {
 
 func writeMarkerTestShard(t *testing.T, store *Store, commitment Commitment, promiseHash []byte) int64 {
 	t.Helper()
-	path := store.shardFilePath(commitment, promiseHash)
-	f, err := store.fs.Create(path, shardWriteCategory)
+	path := store.local.shardPath(commitment, promiseHash)
+	f, err := store.local.fs.Create(path, shardWriteCategory)
 	require.NoError(t, err)
 	require.NoError(t, writeShardBinary(f, &types.BlobShard{
 		Rows: []*types.BlobRow{{Index: 1, Data: []byte("data")}},
 	}))
 	require.NoError(t, f.Close())
-	info, err := store.fs.Stat(path)
+	info, err := store.local.fs.Stat(path)
 	require.NoError(t, err)
 	return info.Size()
 }
