@@ -15,9 +15,13 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/celestiaorg/celestia-app/v10/x/fibre/types"
+	"golang.org/x/time/rate"
 )
 
 const maxObjectDeleteBatchSize = 1000
+
+// ErrObjectReadRateLimited is returned when the object-read limit is exhausted.
+var ErrObjectReadRateLimited = errors.New("object read rate limit exceeded")
 
 type s3ObjectClient interface {
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
@@ -39,17 +43,19 @@ type objectBackend struct {
 	prefix           string
 	chainID          string
 	validatorAddress string
+	readLimiter      *rate.Limiter
 }
 
 var _ shardStorage = (*objectBackend)(nil)
 
-func newObjectBackend(client s3ObjectClient, bucket, prefix, chainID, validatorAddress string) *objectBackend {
+func newObjectBackend(client s3ObjectClient, bucket, prefix, chainID, validatorAddress string, readLimiter *rate.Limiter) *objectBackend {
 	return &objectBackend{
 		client:           client,
 		bucket:           bucket,
 		prefix:           strings.Trim(prefix, "/"),
 		chainID:          chainID,
 		validatorAddress: validatorAddress,
+		readLimiter:      readLimiter,
 	}
 }
 
@@ -93,6 +99,9 @@ func (b *objectBackend) Put(ctx context.Context, commitment Commitment, promiseH
 func (b *objectBackend) Get(ctx context.Context, commitment Commitment, promiseHash []byte) (*types.BlobShard, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !b.readLimiter.Allow() {
+		return nil, ErrObjectReadRateLimited
 	}
 
 	output, err := b.client.GetObject(ctx, &s3.GetObjectInput{

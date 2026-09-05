@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,7 +13,12 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/celestiaorg/celestia-app/v10/x/fibre/types"
+	pebbledb "github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"golang.org/x/time/rate"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestObjectBackendPut(t *testing.T) {
@@ -47,7 +53,7 @@ func TestObjectBackendPut(t *testing.T) {
 				return &s3.PutObjectOutput{}, nil
 			},
 		}
-		backend := newObjectBackend(client, "bucket", "/fibre/", "test-chain", "celestiavalcons1validator")
+		backend := newObjectBackend(client, "bucket", "/fibre/", "test-chain", "celestiavalcons1validator", rate.NewLimiter(rate.Inf, 1))
 
 		created, err := backend.Put(t.Context(), commitment, promiseHash, shard)
 		require.NoError(t, err)
@@ -60,7 +66,7 @@ func TestObjectBackendPut(t *testing.T) {
 				return nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Fault: smithy.FaultClient}
 			},
 		}
-		backend := newObjectBackend(client, "bucket", "fibre", "test-chain", "celestiavalcons1validator")
+		backend := newObjectBackend(client, "bucket", "fibre", "test-chain", "celestiavalcons1validator", rate.NewLimiter(rate.Inf, 1))
 
 		created, err := backend.Put(t.Context(), commitment, promiseHash, shard)
 		require.NoError(t, err)
@@ -79,11 +85,84 @@ func TestObjectBackendGet(t *testing.T) {
 			return &s3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(data.Bytes()))}, nil
 		},
 	}
-	backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator")
+	backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator", rate.NewLimiter(rate.Inf, 1))
 
 	got, err := backend.Get(t.Context(), Commitment{}, []byte{1})
 	require.NoError(t, err)
 	require.Equal(t, shard, got)
+}
+
+func TestObjectBackendGetRateLimitIsShared(t *testing.T) {
+	var (
+		providerErr = errors.New("provider error")
+		calls       int
+	)
+	client := &s3ObjectClientStub{
+		getObject: func(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+			calls++
+			return nil, providerErr
+		},
+	}
+	backend := &objectBackend{
+		client:      client,
+		bucket:      "bucket",
+		readLimiter: rate.NewLimiter(0, 1),
+	}
+
+	_, err := backend.Get(t.Context(), Commitment{}, []byte{1})
+	require.ErrorIs(t, err, providerErr)
+	_, err = backend.Get(t.Context(), Commitment{}, []byte{2})
+
+	require.ErrorIs(t, err, ErrObjectReadRateLimited)
+	require.Equal(t, 1, calls)
+}
+
+func TestObjectReadRateLimitDoesNotAffectLocalReads(t *testing.T) {
+	store := newMarkerTestStore(t)
+	limiter := rate.NewLimiter(0, 1)
+	require.True(t, limiter.Allow())
+	store.object = &objectBackend{readLimiter: limiter}
+
+	commitment := Commitment{1}
+	promiseHash := []byte{2}
+	size := writeMarkerTestShard(t, store, commitment, promiseHash)
+	require.NoError(t, store.db.Set(
+		shardKey(commitment, promiseHash),
+		encodeShardMarker(size),
+		pebbledb.NoSync,
+	))
+
+	_, err := store.Get(t.Context(), commitment)
+	require.NoError(t, err)
+}
+
+func TestServerDownloadShardMapsObjectReadRateLimit(t *testing.T) {
+	store := newMarkerTestStore(t)
+	limiter := rate.NewLimiter(0, 1)
+	require.True(t, limiter.Allow())
+	store.object = &objectBackend{readLimiter: limiter}
+
+	commitment := Commitment{1}
+	promiseHash := []byte{2}
+	require.NoError(t, store.db.Set(
+		shardKey(commitment, promiseHash),
+		encodeShardMarkerForBackend(objectBackendTag, 1),
+		pebbledb.NoSync,
+	))
+	metrics, err := newServerMetrics(otel.Meter("test"), newOccupancy(0))
+	require.NoError(t, err)
+	server := &Server{
+		store:   store,
+		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tracer:  otel.Tracer("test"),
+		metrics: metrics,
+	}
+
+	response, err := server.DownloadShard(t.Context(), &types.DownloadShardRequest{
+		BlobId: NewBlobID(0, commitment),
+	})
+	require.Nil(t, response)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 }
 
 func TestObjectBackendNormalisesMissingObject(t *testing.T) {
@@ -99,7 +178,7 @@ func TestObjectBackendNormalisesMissingObject(t *testing.T) {
 			return nil, missing
 		},
 	}
-	backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator")
+	backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator", rate.NewLimiter(rate.Inf, 1))
 
 	_, err := backend.Get(t.Context(), Commitment{}, []byte{1})
 	require.ErrorIs(t, err, ErrStoreNotFound)
@@ -133,7 +212,7 @@ func TestObjectBackendDeleteObjects(t *testing.T) {
 				}}}, nil
 			},
 		}
-		backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator")
+		backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator", rate.NewLimiter(rate.Inf, 1))
 
 		errs, err := backend.DeleteObjects(t.Context(), ids)
 		require.NoError(t, err)
@@ -148,7 +227,7 @@ func TestObjectBackendDeleteObjects(t *testing.T) {
 				return nil, requestErr
 			},
 		}
-		backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator")
+		backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator", rate.NewLimiter(rate.Inf, 1))
 
 		errs, err := backend.DeleteObjects(t.Context(), ids)
 		require.ErrorIs(t, err, requestErr)
@@ -156,7 +235,7 @@ func TestObjectBackendDeleteObjects(t *testing.T) {
 	})
 
 	t.Run("batch limit", func(t *testing.T) {
-		backend := newObjectBackend(&s3ObjectClientStub{}, "bucket", "prefix", "chain", "validator")
+		backend := newObjectBackend(&s3ObjectClientStub{}, "bucket", "prefix", "chain", "validator", rate.NewLimiter(rate.Inf, 1))
 		_, err := backend.DeleteObjects(t.Context(), make([]shardID, maxObjectDeleteBatchSize+1))
 		require.ErrorContains(t, err, "maximum is 1000")
 	})
