@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -75,11 +76,12 @@ func (b *objectBackend) Put(ctx context.Context, commitment Commitment, promiseH
 	_, putErr := b.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(b.bucket),
 		Key:           aws.String(b.objectKey(commitment, promiseHash)),
-		Body:          reader,
+		Body:          io.NopCloser(reader), // Preserve ContentLength; the SDK treats a bare pipe as unknown-length.
 		ContentLength: aws.Int64(shardBinarySize(shard)),
 		IfNoneMatch:   aws.String("*"),
 	}, func(options *s3.Options) {
 		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		options.APIOptions = append(options.APIOptions, v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware)
 	})
 	_ = reader.CloseWithError(putErr)
 	writeErr := <-writeDone
