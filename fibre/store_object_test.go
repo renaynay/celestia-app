@@ -6,6 +6,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -115,6 +118,28 @@ func TestObjectBackendGetRateLimitIsShared(t *testing.T) {
 
 	require.ErrorIs(t, err, ErrObjectReadRateLimited)
 	require.Equal(t, 1, calls)
+}
+
+func TestObjectBackendGetDoesNotRetry(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client := s3.New(s3.Options{
+		Region:       "auto",
+		BaseEndpoint: aws.String(server.URL),
+		Credentials:  aws.AnonymousCredentials{},
+	})
+	backend := newObjectBackend(client, "bucket", "prefix", "chain", "validator", rate.NewLimiter(0, 1))
+
+	_, err := backend.Get(t.Context(), Commitment{}, []byte{1})
+	require.Error(t, err)
+	require.EqualValues(t, 1, calls.Load())
+	_, err = backend.Get(t.Context(), Commitment{}, []byte{2})
+	require.ErrorIs(t, err, ErrObjectReadRateLimited)
+	require.EqualValues(t, 1, calls.Load())
 }
 
 func TestObjectReadRateLimitDoesNotAffectLocalReads(t *testing.T) {

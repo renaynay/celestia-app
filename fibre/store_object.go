@@ -109,6 +109,8 @@ func (b *objectBackend) Get(ctx context.Context, commitment Commitment, promiseH
 	output, err := b.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(b.bucket),
 		Key:    aws.String(b.objectKey(commitment, promiseHash)),
+	}, func(options *s3.Options) {
+		options.RetryMaxAttempts = 1
 	})
 	if isObjectNotFound(err) {
 		return nil, ErrStoreNotFound
