@@ -29,6 +29,7 @@ func TestServerConfigSaveAndLoad(t *testing.T) {
 	cfg.ServerListenAddress = "changed"
 	require.NoError(t, cfg.Load(configPath))
 	assert.Equal(t, "0.0.0.0:7980", cfg.ServerListenAddress)
+	assert.Equal(t, "local", cfg.StorageBackend)
 }
 
 func TestServerConfigSaveIncludesFieldComments(t *testing.T) {
@@ -91,4 +92,32 @@ func TestServerConfigValidateNoSigner(t *testing.T) {
 	err := cfg.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "signer_grpc_address is required")
+}
+
+func TestServerConfigObjectStorageRoundTrip(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+	var (
+		cfg        = DefaultServerConfig()
+		loaded     = DefaultServerConfig()
+		configPath = DefaultConfigPath(t.TempDir())
+	)
+	cfg.StorageBackend = "object"
+	cfg.ObjectStorage = testObjectStorageConfig()
+	cfg.Path = "runtime-store-path"
+	cfg.ChainID = "runtime-chain"
+	cfg.ValidatorAddress = "runtime-validator"
+	require.NoError(t, cfg.Save(configPath))
+	require.NoError(t, loaded.Load(configPath))
+	require.Equal(t, "object", loaded.StorageBackend)
+	require.Equal(t, cfg.ObjectStorage, loaded.ObjectStorage)
+	require.Empty(t, loaded.Path)
+	require.Empty(t, loaded.ChainID)
+	require.Empty(t, loaded.ValidatorAddress)
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	for _, excluded := range []string{"test-access-key", "test-secret-key", "runtime-store-path", "runtime-chain", "runtime-validator", "access_key", "secret_key"} {
+		require.NotContains(t, string(data), excluded)
+	}
+	require.Contains(t, string(data), "[object_storage]")
 }
