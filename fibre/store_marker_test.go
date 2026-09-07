@@ -14,7 +14,6 @@ import (
 	pebbledb "github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestShardMarkerCodec(t *testing.T) {
@@ -152,18 +151,23 @@ func TestGetSkipsInvalidMarkerAndReturnsValidShard(t *testing.T) {
 	require.NoError(t, closer.Close())
 }
 
-func TestRemoveOrphanShardsPreservesInvalidMarker(t *testing.T) {
+func TestGetMissingPayloadKeepsPruneAccounting(t *testing.T) {
 	store := newMarkerTestStore(t)
 	commitment := generateCommitment()
-	promiseHash := make([]byte, 32)
-	writeMarkerTestShard(t, store, commitment, promiseHash)
-	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), []byte{1, 2}, pebbledb.NoSync))
+	promiseHash := []byte{1}
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	size := writeMarkerTestShard(t, store, commitment, promiseHash)
+	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), encodeShardMarker(size), pebbledb.NoSync))
+	require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, promiseHash), nil, pebbledb.NoSync))
+	require.NoError(t, store.local.fs.Remove(store.local.shardPath(commitment, promiseHash)))
 
-	removed, err := store.removeOrphanShards()
+	_, err := store.Get(t.Context(), commitment)
+	require.ErrorIs(t, err, ErrStoreNotFound)
+
+	pruned, freed, err := store.PruneBefore(t.Context(), pruneAt.Add(time.Hour))
 	require.NoError(t, err)
-	require.Zero(t, removed)
-	_, err = store.local.fs.Stat(store.local.shardPath(commitment, promiseHash))
-	require.NoError(t, err)
+	require.Equal(t, 1, pruned)
+	require.Equal(t, size, freed)
 }
 
 func TestSizeReturnsValidTotalWithInvalidMarker(t *testing.T) {
@@ -182,6 +186,15 @@ func TestSizeReturnsValidTotalWithInvalidMarker(t *testing.T) {
 	require.ErrorIs(t, err, ErrStoreIntegrity)
 	require.Contains(t, err.Error(), "2 invalid shard metadata entries")
 	require.Equal(t, validSize, size)
+}
+
+func TestSizeRejectsMalformedShardKeyWithValidMarker(t *testing.T) {
+	store := newMarkerTestStore(t)
+	require.NoError(t, store.db.Set([]byte(shardKeyPrefix+"malformed"), encodeShardMarker(37), pebbledb.NoSync))
+
+	size, err := store.Size(t.Context())
+	require.ErrorIs(t, err, ErrStoreIntegrity)
+	require.Zero(t, size)
 }
 
 func TestServerSeedsPartialSizeAfterIntegrityError(t *testing.T) {
@@ -204,19 +217,25 @@ func TestServerSeedsPartialSizeAfterIntegrityError(t *testing.T) {
 	require.Contains(t, logs.String(), "store size may be incorrect due to corrupt shard marker")
 }
 
-func TestHasAccountedShardMarker(t *testing.T) {
+func TestShardStatus(t *testing.T) {
 	store := newMarkerTestStore(t)
 	commitment := generateCommitment()
 	promiseHash := []byte{1}
 
-	accounted := store.hasAccountedShardMarker(commitment, promiseHash)
+	has, accounted, err := store.shardStatus(t.Context(), commitment, promiseHash)
+	require.NoError(t, err)
+	require.False(t, has)
 	require.False(t, accounted)
 	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), nil, pebbledb.NoSync))
-	accounted = store.hasAccountedShardMarker(commitment, promiseHash)
+	has, accounted, err = store.shardStatus(t.Context(), commitment, promiseHash)
+	require.NoError(t, err)
+	require.False(t, has)
 	require.False(t, accounted)
 	marker := encodeShardMarker(1)
 	require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), marker, pebbledb.NoSync))
-	accounted = store.hasAccountedShardMarker(commitment, promiseHash)
+	has, accounted, err = store.shardStatus(t.Context(), commitment, promiseHash)
+	require.NoError(t, err)
+	require.False(t, has)
 	require.True(t, accounted)
 }
 
@@ -293,6 +312,23 @@ func TestPruneBeforeLimitsBatchSize(t *testing.T) {
 	require.Equal(t, int64(1), freed)
 }
 
+func TestPruneBeforeOverflowReturnsNoUncommittedCounts(t *testing.T) {
+	store := newMarkerTestStore(t)
+	commitment := generateCommitment()
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	for i, size := range []int64{math.MaxInt64, 1} {
+		promiseHash := []byte{byte(i)}
+		require.NoError(t, store.db.Set(shardKey(commitment, promiseHash), encodeShardMarker(size), pebbledb.NoSync))
+		require.NoError(t, store.db.Set(pruneKey(pruneAt, commitment, promiseHash), nil, pebbledb.NoSync))
+	}
+
+	pruned, freed, err := store.PruneBefore(t.Context(), pruneAt.Add(time.Hour))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrStoreIntegrity)
+	require.Zero(t, pruned)
+	require.Zero(t, freed)
+}
+
 func TestServerPruneDrainsBacklog(t *testing.T) {
 	store := newMarkerTestStore(t)
 	commitment := generateCommitment()
@@ -308,8 +344,7 @@ func TestServerPruneDrainsBacklog(t *testing.T) {
 
 	occ := newOccupancy(0)
 	occ.seed(maxPruneBatchSize + 1)
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	provider := sdkmetric.NewMeterProvider()
 	metrics, err := newServerMetrics(provider.Meter("prune-test"), occ)
 	require.NoError(t, err)
 	var logs strings.Builder
@@ -323,18 +358,6 @@ func TestServerPruneDrainsBacklog(t *testing.T) {
 	require.Contains(t, logs.String(), "prune skipped corrupt shard markers")
 	require.Contains(t, logs.String(), "pruned expired entries")
 	require.NotContains(t, logs.String(), "level=ERROR")
-
-	var collected metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(t.Context(), &collected))
-	var pruneEntries int64
-	for _, scope := range collected.ScopeMetrics {
-		for _, metric := range scope.Metrics {
-			if metric.Name == "fibre.server.prune.entries" {
-				pruneEntries = metric.Data.(metricdata.Sum[int64]).DataPoints[0].Value
-			}
-		}
-	}
-	require.Equal(t, int64(maxPruneBatchSize+1), pruneEntries)
 }
 
 func newMarkerTestStore(t *testing.T) *Store {

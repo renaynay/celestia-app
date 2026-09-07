@@ -4,13 +4,11 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/celestiaorg/celestia-app/v10/x/fibre/types"
 	"github.com/cockroachdb/pebble/v2/vfs"
@@ -67,17 +65,11 @@ func (b *localBackend) Put(ctx context.Context, commitment Commitment, promiseHa
 	return true, nil
 }
 
-func (b *localBackend) Get(ctx context.Context, commitment Commitment, promiseHash []byte) (*types.BlobShard, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+func (b *localBackend) Get(_ context.Context, commitment Commitment, promiseHash []byte) (*types.BlobShard, error) {
 	return readShardFile(b.fs, b.shardPath(commitment, promiseHash))
 }
 
-func (b *localBackend) Has(ctx context.Context, commitment Commitment, promiseHash []byte) (bool, error) {
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
+func (b *localBackend) Has(_ context.Context, commitment Commitment, promiseHash []byte) (bool, error) {
 	_, err := b.fs.Stat(b.shardPath(commitment, promiseHash))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -166,35 +158,4 @@ func (b *localBackend) resetStaging() (int, error) {
 		return len(entries), fmt.Errorf("recreating staging: %w", err)
 	}
 	return len(entries), nil
-}
-
-func (b *localBackend) removeOrphans(hasMarker func(Commitment, []byte) (bool, error)) (int, error) {
-	dir := filepath.Join(b.path, shardsSubdir)
-	names, err := b.fs.List(dir)
-	if err != nil {
-		return 0, fmt.Errorf("listing shard files: %w", err)
-	}
-
-	var removed int
-	for _, name := range names {
-		commitmentHex, promiseHashHex, ok := strings.Cut(name, "-")
-		commitment, commitmentErr := CommitmentFromString(commitmentHex)
-		promiseHash, hashErr := hex.DecodeString(promiseHashHex)
-		if !ok || commitmentErr != nil || hashErr != nil || len(promiseHash) != sha256.Size {
-			continue
-		}
-
-		has, err := hasMarker(commitment, promiseHash)
-		if err != nil {
-			return removed, err
-		}
-		if has {
-			continue
-		}
-		if err := b.Delete(context.Background(), commitment, promiseHash); err != nil {
-			return removed, err
-		}
-		removed++
-	}
-	return removed, nil
 }

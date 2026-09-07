@@ -29,7 +29,7 @@ func TestStore(t *testing.T) {
 		{"Put_ConcurrentSameKey", testStorePutConcurrentSameKey},
 		{"Get_NotFound", testStoreGetNotFound},
 		{"Get_DeterministicOrdering", testStoreGetDeterministicOrdering},
-		{"Get_CleansOrphanMarker", testStoreGetCleansOrphanMarker},
+		{"Get_SkipsMissingPayload", testStoreGetSkipsMissingPayload},
 		{"Get_SkipsOrphanToSibling", testStoreGetSkipsOrphanToSibling},
 		{"Get_AllOrphans", testStoreGetAllOrphans},
 		{"PutGet_PreservesRLCs", testStorePutGetPreservesRLCs},
@@ -355,8 +355,9 @@ func testStoreGetDeterministicOrdering(t *testing.T, store *fibre.Store, _ strin
 	}
 }
 
-// Reconcile drops staging leftovers and orphan shard files on open.
-func TestStoreReconcile(t *testing.T) {
+// Reconcile drops staging/ leftovers on open, leaves real shards alone, and
+// logs the cleanup count.
+func TestStoreReconcileStaging(t *testing.T) {
 	cfg := fibre.DefaultStoreConfig()
 	cfg.Path = t.TempDir()
 	store, err := fibre.NewStore(cfg)
@@ -374,10 +375,6 @@ func TestStoreReconcile(t *testing.T) {
 	staleB := filepath.Join(stagingDir, "bbb")
 	require.NoError(t, os.WriteFile(staleA, []byte("partial-a"), 0o644))
 	require.NoError(t, os.WriteFile(staleB, []byte("partial-b"), 0o644))
-	orphan := filepath.Join(cfg.Path, "shards", strings.Repeat("0", 64)+"-"+strings.Repeat("1", 64))
-	unknown := filepath.Join(cfg.Path, "shards", "unknown")
-	require.NoError(t, os.WriteFile(orphan, []byte("orphan"), 0o644))
-	require.NoError(t, os.WriteFile(unknown, []byte("unknown"), 0o644))
 
 	var buf strings.Builder
 	cfg.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -390,10 +387,6 @@ func TestStoreReconcile(t *testing.T) {
 		_, err := os.Stat(p)
 		require.True(t, os.IsNotExist(err), "%s should be removed by reconcile", p)
 	}
-	_, err = os.Stat(orphan)
-	require.True(t, os.IsNotExist(err), "%s should be removed by reconcile", orphan)
-	_, err = os.Stat(unknown)
-	require.NoError(t, err)
 	st, err := os.Stat(stagingDir)
 	require.NoError(t, err)
 	require.True(t, st.IsDir())
@@ -401,16 +394,14 @@ func TestStoreReconcile(t *testing.T) {
 	out := buf.String()
 	require.Contains(t, out, "store reconcile complete")
 	require.Contains(t, out, "staging_files_removed=2")
-	require.Contains(t, out, "orphan_files_removed=1")
 
 	got, err := store.Get(t.Context(), blob.ID().Commitment())
 	require.NoError(t, err)
 	require.Len(t, got.Rows, 2)
 }
 
-// Get drops a /shard/ marker whose backing file is missing (crash between
-// pebble commit and rename) so future Gets stop paying the missed lookup.
-func testStoreGetCleansOrphanMarker(t *testing.T, store *fibre.Store, path string) {
+// Get skips a marker whose backing file is missing.
+func testStoreGetSkipsMissingPayload(t *testing.T, store *fibre.Store, path string) {
 	blob := makeTestBlobV0(t, 256)
 	shard := makeShardFrom(t, blob, 0, 1)
 	promise := makeTestPaymentPromise(100, blob.ID())
@@ -425,8 +416,7 @@ func testStoreGetCleansOrphanMarker(t *testing.T, store *fibre.Store, path strin
 	_, err = store.Get(t.Context(), blob.ID().Commitment())
 	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
 
-	// After the first Get drops the marker, a fresh Put with a different
-	// promise must be the one Get finds, proving the orphan slot is gone.
+	// A fresh Put with a different promise must still be the one Get finds.
 	promise2 := makeTestPaymentPromise(101, blob.ID())
 	shard2 := makeShardFrom(t, blob, 2, 3)
 	require.NoError(t, store.Put(t.Context(), promise2, shard2, promise2.CreationTimestamp))
@@ -464,8 +454,7 @@ func testStoreGetSkipsOrphanToSibling(t *testing.T, store *fibre.Store, path str
 	require.Equal(t, validRow, got.Rows[0].Index)
 }
 
-// All shards for a commit are orphans, so Get returns NotFound (and cleans
-// the markers along the way).
+// If all payloads for a commitment are missing, Get returns NotFound.
 func testStoreGetAllOrphans(t *testing.T, store *fibre.Store, path string) {
 	blob := makeTestBlobV0(t, 256)
 	for i := range 3 {
